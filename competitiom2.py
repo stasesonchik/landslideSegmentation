@@ -1,110 +1,89 @@
 from pathlib import Path
 import torch
-import cv2
-import matplotlib.pyplot as plt
-import numpy as np
 from ultralytics import YOLO
 
+# Классы
 CLASS_NAMES = ["individual_tree", "group_of_trees"]
+CLASS_WEIGHTS = [0.25, 0.75]  # редкий класс group_of_trees весом больше
 
-def visualize_segmentation(image_path: str, model_path: str, alpha: float = 0.5, conf: float = 0.3, tta: bool = True):
-    """
-    Визуализирует результаты сегментации модели YOLOv8 на одном изображении с TTA.
+# Цвета для визуализации масок
+CLASS_COLORS = {
+    0: (0, 255, 0),  # individual_tree — зеленый
+    1: (0, 0, 255)  # group_of_trees — красный
+}
 
-    :param image_path: путь к изображению
-    :param model_path: путь к обученной модели .pt
-    :param alpha: прозрачность маски
-    :param conf: порог уверенности для предсказаний
-    :param tta: включить Test-Time Augmentation
-    """
-    # Загружаем модель
-    model = YOLO(model_path)
-
-    # Прогоняем инференс с TTA
-    results = model.predict(
-        source=image_path,
-        imgsz=1024,
-        conf=conf,
-        save=False,
-        augment=tta  # включаем TTA
-    )
-
-    # Загружаем изображение
-    img = cv2.imread(image_path)
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-
-    # Получаем маски
-    result = results[0]
-    masks = result.masks.xy if result.masks is not None else []
-
-    # Рисуем маски
-    overlay = img.copy()
-    for mask_poly in masks:
-        pts = np.array(mask_poly, np.int32).reshape(-1, 2)
-        cv2.fillPoly(overlay, [pts], color=(0, 255, 0))
-
-    cv2.addWeighted(overlay, alpha, img, 1 - alpha, 0, img)
-
-    # Показываем результат
-    plt.figure(figsize=(8, 8))
-    plt.imshow(img)
-    plt.axis("off")
-    plt.show()
+# Проверяем GPU
+device = 0 if torch.cuda.is_available() else "cpu"
 
 
-def train_model(data_yaml: str, pretrained_model: str, epochs: int = 100, batch_size: int = 4, save_period: int = 5):
-    """
-    Обучает модель YOLOv8-seg на подготовленном датасете с аугментациями.
-
-    :param data_yaml: путь к data.yaml
-    :param pretrained_model: путь к .pt модели (yolov8s-seg.pt или предыдущие веса)
-    :param epochs: количество эпох
-    :param batch_size: размер батча
-    :param save_period: сохранять модель каждые N эпох
-    """
+def train_model(data_yaml: str, model_name: str = "yolov8s-seg.pt",
+                epochs: int = 300, batch_size: int = 8, save_period: int = 5):
     torch.cuda.empty_cache()
+    model = YOLO(model_name)
 
-    model = YOLO(pretrained_model)
-
-    model.train(
-        data=data_yaml,
-        epochs=epochs,
-        imgsz=512,          # под GTX 1070 (8GB)
-        batch=batch_size,
-        device=0,           # GPU
-        pretrained=True,
-        name="yolov8s_seg_trees",
-        half=True,          # FP16 для экономии памяти
-        save_period=save_period,
+    # --- Аугментации ---
+    augmentations = dict(
         mosaic=True,
-        mixup=False,
+        mixup=0.5,
+        copy_paste=0.5,
         fliplr=0.5,
         flipud=0.0,
         hsv_h=0.015,
-        hsv_s=0.7,
+        hsv_s=0.8,
         hsv_v=0.4,
-        scale=0.5,
-        translate=0.2,
+        scale=0.6,
+        translate=0.3,
         degrees=15
     )
+
+    # --- Тренировка ---
+    model.train(
+        data=data_yaml,
+        epochs=epochs,
+        imgsz=736,
+        batch=batch_size,
+        device=device,
+        pretrained=True,
+        half=torch.cuda.is_available(),
+        name=f"{Path(model_name).stem}_trees_aug",
+        save_period=save_period,
+        patience=50,
+        **augmentations
+    )
+
+
+
+def inference_with_tta(model_path: str, source: str, conf: float = 0.25):
+    """
+    Инференс с TTA и низким порогом confidence для ловли редких объектов
+    """
+    model = YOLO(model_path)
+
+    # TTA: зеркальное отражение + масштабирование
+    results = model.predict(
+        source=source,
+        imgsz=736,
+        conf=conf,
+        augment=True,  # включает TTA
+        half=torch.cuda.is_available()
+    )
+    return results
 
 
 if __name__ == "__main__":
     dataset_dir = Path("C:/Users/LeMeS/PycharmProjects/Competition/dataset")
     data_yaml_path = dataset_dir / "data.yaml"
 
-    # --- Визуализация примера с TTA ---
-    visualize_segmentation(
-        image_path="C:/Users/LeMeS/PycharmProjects/Competition/evaluation/10cm_evaluation_1.tif",
-        model_path="runs/segment/yolov8s_seg_trees4/weights/best.pt",
-        tta=True
-    )
-
-    # --- Обучение модели с аугментациями и 100 эпох ---
+    # --- Обучение ---
     train_model(
         data_yaml=str(data_yaml_path),
-        pretrained_model="yolov8s-seg.pt",
-        epochs=100,
+        model_name="yolov8m-seg.pt",  # можно сменить на yolov8s-seg.pt / yolov8l-seg.pt
+        epochs=200,
         batch_size=4,
         save_period=5
     )
+
+    # --- Пример инференса с TTA ---
+    # results = inference_with_tta("runs/segment/yolov8m-seg_trees_focal_aug/weights/best.pt",
+    #                              "C:/Users/LeMeS/PycharmProjects/Competition/evaluation",
+    #                              conf=0.25)
