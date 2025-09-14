@@ -1,3 +1,4 @@
+
 import os
 import random
 import numpy as np
@@ -18,7 +19,17 @@ DEVICE = CFG.DEVICE
 NUM_CLASSES = len(CFG.CLASS_NAMES) + 1
 class_to_id = {name: i+1 for i, name in enumerate(CFG.CLASS_NAMES)}
 
-EPOCHS = 30  # Для Optuna меньше
+EPOCHS = 30
+
+# ====== Веса по сценам и разрешению ======
+SCENE_WEIGHTS = {
+    "agriculture_plantation": 2.0,
+    "urban_area": 1.5,
+    "rural_area": 1.0,
+    "industrial_area": 1.25,
+    "open_field": 1.0
+}
+RESOLUTION_WEIGHTS = {"10":1.0,"20":1.25,"40":2.0,"60":2.5,"80":3.0}
 
 # -------------------------
 def seed_everything(seed=42):
@@ -36,7 +47,6 @@ def build_model(encoder_name="resnet18", freeze_until="layer2"):
         in_channels=3,
         classes=NUM_CLASSES
     )
-    # заморозка encoder
     freeze = True
     for name, param in model.encoder.named_parameters():
         if freeze:
@@ -46,13 +56,17 @@ def build_model(encoder_name="resnet18", freeze_until="layer2"):
     return model.to(DEVICE)
 
 # -------------------------
-class CombinedLoss(nn.Module):
-    def __init__(self):
+class WeightedCombinedLoss(nn.Module):
+    def __init__(self, df=None):
         super().__init__()
         self.dice = smp.losses.DiceLoss(mode="multiclass")
         self.ce = nn.CrossEntropyLoss()
-    def forward(self, outputs, masks):
-        return self.dice(outputs, masks) + self.ce(outputs, masks)
+
+    def forward(self, outputs, masks, file_names=None):
+        # обычный CrossEntropy без весов
+        ce_loss = self.ce(outputs, masks)
+        dice_loss = self.dice(outputs, masks)
+        return dice_loss + ce_loss
 
 # -------------------------
 def iou_score(preds, target, num_classes=NUM_CLASSES):
@@ -69,7 +83,7 @@ def iou_score(preds, target, num_classes=NUM_CLASSES):
 # -------------------------
 def map_at_iou(preds, target, iou_thresh=0.75, num_classes=NUM_CLASSES):
     preds, target = preds.detach().cpu().numpy(), target.detach().cpu().numpy()
-    matches_per_class, totals = [], []
+    matches_per_class = []
     for cls in range(1, num_classes):
         p_mask=(preds==cls).astype(np.uint8)
         t_mask=(target==cls).astype(np.uint8)
@@ -77,71 +91,11 @@ def map_at_iou(preds, target, iou_thresh=0.75, num_classes=NUM_CLASSES):
         union=(p_mask|t_mask).sum()
         match = 1 if union>0 and inter/union>=iou_thresh else 0
         matches_per_class.append(match)
-        totals.append(1)
     return np.mean(matches_per_class), matches_per_class
 
 # -------------------------
-def train_one_epoch(model, loader, criterion, optimizer):
-    model.train()
-    epoch_loss=0.0
-    for images,masks in loader:
-        images, masks = images.to(DEVICE), masks.to(DEVICE)
-        optimizer.zero_grad()
-        outputs = model(images)
-        loss = criterion(outputs, masks)
-        loss.backward()
-        optimizer.step()
-        epoch_loss += loss.item()*images.size(0)
-    return epoch_loss/len(loader.dataset)
-
-# -------------------------
-def validate_one_epoch(model, loader, criterion):
-    model.eval()
-    val_loss=0.0
-    val_map=0.0
-    val_ious=[]
-    classwise_iou_sum = np.zeros(NUM_CLASSES-1)
-    classwise_counts = np.zeros(NUM_CLASSES-1)
-    with torch.no_grad():
-        for images, masks in loader:
-            images, masks = images.to(DEVICE), masks.to(DEVICE)
-            outputs = model(images)
-            val_loss += criterion(outputs, masks).item()*images.size(0)
-            preds = torch.argmax(outputs, dim=1)
-            batch_map, batch_class_matches = map_at_iou(preds, masks)
-            val_map += batch_map
-            _, batch_class_iou = iou_score(preds, masks)
-            val_ious.append(np.mean(batch_class_iou))
-            classwise_iou_sum += np.array(batch_class_iou)
-            classwise_counts += 1
-    val_loss /= len(loader.dataset)
-    val_map /= len(loader)
-    val_ious_mean = np.mean(val_ious)
-    classwise_iou_mean = classwise_iou_sum / classwise_counts
-    return val_loss, val_map, val_ious_mean, classwise_iou_mean
-
-# -------------------------
-def plot_metrics(train_losses, val_losses, val_ious, val_maps):
-    plt.figure(figsize=(12,4))
-    plt.subplot(1,3,1)
-    plt.plot(train_losses,label="train")
-    plt.plot(val_losses,label="val")
-    plt.title("Loss")
-    plt.legend()
-    plt.subplot(1,3,2)
-    plt.plot(val_ious,label="val_iou")
-    plt.title("IoU")
-    plt.legend()
-    plt.subplot(1,3,3)
-    plt.plot(val_maps,label="val_map@0.75")
-    plt.title("mAP@0.75")
-    plt.legend()
-    plt.show()
-
-# -------------------------
-# ------------------------- ОБНОВЛЁННЫЙ objective с логированием -------------------------
 def objective(trial):
-    # гиперпараметры аугментации
+    # аугментации
     train_tf = A.Compose([
         A.Resize(CFG.IMG_SIZE, CFG.IMG_SIZE),
         A.HorizontalFlip(p=trial.suggest_float("hflip_p",0,1)),
@@ -163,18 +117,15 @@ def objective(trial):
         ToTensorV2()
     ])
 
-    # encoder и lr/batch_size
     encoder = trial.suggest_categorical("encoder", ["resnet18"])
     lr = trial.suggest_float("lr",1e-5,1e-3,log=True)
-    batch_size = trial.suggest_categorical("batch_size",[2,4,8])
+    batch_size = trial.suggest_categorical("batch_size",[2,4])
 
     print(f"\n=== Trial {trial.number} ===")
     print(f"Encoder: {encoder}, lr: {lr:.1e}, batch_size: {batch_size}")
-    print("Augmentation parameters:")
-    print({k: v for k, v in trial.params.items() if k not in ["encoder", "lr", "batch_size"]})
 
     df = parse_annotations(CFG.TRAIN_ANNOT_PATH)
-    dataset = CanopyDataset(CFG.TRAIN_IMG_PATH, df, class_to_id, transforms=train_tf)
+    dataset = CanopyDataset(CFG.TRAIN_IMG_PATH, df, class_to_id, transforms=train_tf, return_filename=True)
     train_size = int(0.8*len(dataset))
     val_size = len(dataset) - train_size
     train_ds, val_ds = random_split(dataset,[train_size,val_size])
@@ -184,39 +135,41 @@ def objective(trial):
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
 
     model = build_model(encoder, freeze_until="layer2")
-    criterion = CombinedLoss()
+    criterion = WeightedCombinedLoss(SCENE_WEIGHTS)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
-    train_losses, val_losses, val_ious, val_maps = [], [], [], []
+    trial_save_path = os.path.join(CFG.SAVE_PATH,f"trial_{trial.number}")
+    os.makedirs(trial_save_path, exist_ok=True)
+
     best_val_map = -1.0
 
     for epoch in range(EPOCHS):
         print(f"\n--- Epoch {epoch+1}/{EPOCHS} ---")
-        # прогресс по батчам
+
+        # ==== TRAIN ====
         model.train()
         epoch_loss = 0.0
-        for images, masks in tqdm(train_loader, desc="Training", leave=False):
+        for images, masks, file_names in tqdm(train_loader, desc="Training", leave=False):
             images, masks = images.to(DEVICE), masks.to(DEVICE)
             optimizer.zero_grad()
             outputs = model(images)
-            loss = criterion(outputs, masks)
+            loss = criterion(outputs, masks, file_names)
             loss.backward()
             optimizer.step()
             epoch_loss += loss.item()*images.size(0)
-        train_losses.append(epoch_loss/len(train_loader.dataset))
+        train_loss = epoch_loss/len(train_loader.dataset)
 
-        # валидация
+        # ==== VALID ====
         model.eval()
-        val_loss, val_map, val_iou, classwise_iou = 0,0,0,[0]*len(CFG.CLASS_NAMES)
-        val_loss_acc, val_map_acc, val_ious_acc = [],[],[]
+        val_loss, val_map, val_ious_acc = 0,0,[]
         classwise_iou_sum = np.zeros(NUM_CLASSES-1)
         classwise_counts = np.zeros(NUM_CLASSES-1)
 
         with torch.no_grad():
-            for images, masks in tqdm(val_loader, desc="Validation", leave=False):
+            for images, masks, file_names in tqdm(val_loader, desc="Validation", leave=False):
                 images, masks = images.to(DEVICE), masks.to(DEVICE)
                 outputs = model(images)
-                val_loss += criterion(outputs, masks).item()*images.size(0)
+                val_loss += criterion(outputs, masks, file_names).item()*images.size(0)
                 preds = torch.argmax(outputs, dim=1)
                 batch_map, _ = map_at_iou(preds, masks)
                 _, batch_class_iou = iou_score(preds, masks)
@@ -227,24 +180,19 @@ def objective(trial):
 
         val_loss /= len(val_loader.dataset)
         val_map /= len(val_loader)
-        val_ious_mean = np.mean(val_ious_acc)
+        val_iou_mean = np.mean(val_ious_acc)
         classwise_iou_mean = classwise_iou_sum / classwise_counts
 
-        val_losses.append(val_loss)
-        val_ious.append(val_ious_mean)
-        val_maps.append(val_map)
-
-        print(f"train_loss: {train_losses[-1]:.4f} | val_loss: {val_loss:.4f} | val_iou: {val_ious_mean:.4f} | val_map@0.75: {val_map:.4f}")
+        print(f"train_loss: {train_loss:.4f} | val_loss: {val_loss:.4f} | val_iou: {val_iou_mean:.4f} | val_map@0.75: {val_map:.4f}")
         print(f"Classwise IoU: {dict(zip(CFG.CLASS_NAMES,classwise_iou_mean))}")
 
         if val_map > best_val_map:
             best_val_map = val_map
-            torch.save(model.state_dict(), os.path.join(CFG.SAVE_PATH,"best_model.pth"))
-            print("-> Saved best model!")
+            torch.save(model.state_dict(), os.path.join(trial_save_path,"best_model.pth"))
+            print("-> Saved best model for this trial!")
 
     print(f"\nTrial {trial.number} finished | Best mAP@0.75: {best_val_map:.4f}")
-    return -best_val_map  # минимизируем для Optuna
-
+    return -best_val_map
 
 # -------------------------
 if __name__=="__main__":
@@ -253,3 +201,4 @@ if __name__=="__main__":
     study = optuna.create_study(direction="minimize")
     study.optimize(objective, n_trials=10)
     print("Best trial params:", study.best_trial.params)
+
