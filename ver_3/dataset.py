@@ -54,6 +54,8 @@ def parse_annotations(annot_path):
                 'file_name': img_info['file_name'],
                 'height': img_info['height'],
                 'width': img_info['width'],
+                'scene_type': img_info.get('scene_type', "unknown"),
+                'cm_resolution': img_info.get('cm_resolution', 10),
                 'class': annot['class'],
                 'segmentation': annot['segmentation']
             })
@@ -66,12 +68,13 @@ NUM_CLASSES = len(CFG.CLASS_NAMES) + 1  # +1 for background
 
 # ================= DATASET ===================
 class CanopyDataset(Dataset):
-    def __init__(self, image_dir, df, class_to_id, transforms=None, is_test=False):
+    def __init__(self, image_dir, df, class_to_id, transforms=None, is_test=False, return_filename=False):
         self.image_paths = sorted(glob.glob(os.path.join(image_dir, "*.tif")))
         self.df = df
         self.class_to_id = class_to_id
         self.transforms = transforms
         self.is_test = is_test
+        self.return_filename = return_filename
 
     def __len__(self):
         return len(self.image_paths)
@@ -88,7 +91,9 @@ class CanopyDataset(Dataset):
             if self.transforms:
                 transformed = self.transforms(image=image)
                 image = transformed['image']
-            return image, file_name, original_size
+            if self.return_filename:
+                return image, file_name, original_size
+            return image, original_size
 
         height, width = image.shape[:2]
         mask = np.zeros((height, width), dtype=np.int32)
@@ -98,7 +103,7 @@ class CanopyDataset(Dataset):
             class_id = self.class_to_id.get(row['class'])
             if class_id:
                 segmentation = np.array(row['segmentation'], dtype=np.int32).reshape(-1, 2)
-                epsilon = 5.0
+                epsilon = max(1.0, 0.01 * cv2.arcLength(segmentation, True))
                 simplified = cv2.approxPolyDP(segmentation, epsilon, True)
                 simplified = simplified.reshape(-1, 2)
                 cv2.fillPoly(mask, [simplified], color=class_id)
@@ -108,4 +113,6 @@ class CanopyDataset(Dataset):
             image = transformed['image']
             mask = transformed['mask']
 
+        if self.return_filename:
+            return image, mask.long(), file_name
         return image, mask.long()
